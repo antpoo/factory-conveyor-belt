@@ -1,12 +1,27 @@
 # importing required dependencies
 from flask import Flask, render_template
+from flask_mqtt import Mqtt
 from flask_apscheduler import APScheduler
 from time import sleep
-import paho.mqtt.client as mqtt
+from flask_socketio import SocketIO, emit
 import RPi.GPIO as GPIO
+import gpiozero
+import serial
 
 # creating flask objects
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'secret!'
+app.config['MQTT_BROKER_URL'] = '192.168.1.25'  # Change this to the broker address if needed
+app.config['MQTT_BROKER_PORT'] = 1883
+app.config['MQTT_KEEPALIVE'] = 60
+app.config['MQTT_USERNAME'] = ""
+app.config['MQTT_PASSWORD'] = ""
+app.config['MQTT_TLS_ENABLED'] = False
+app.config['MQTT_CLEAN_SESSION'] = True
+
+
+socketio = SocketIO(app)
+mqtt = Mqtt(app)
 
 # a list to store each component's name
 COMPONENTS = ["conveyor", "measuring", "mixing", "baking", "topping", "packaging", "cleaning"]
@@ -22,64 +37,74 @@ status = {
 	"cleaning": 0
 }
 
-# creating mqtt object
-m_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, "andrew_pi")
 
-# method for connecting and subscribing to each component
-def on_connect(client, userdata, flags, reason_code, properties):
-	print(f"Connected with result code {reason_code}")
+# MQTT event handlers
+@mqtt.on_connect()
+def handle_connect(client, userdata, flags, rc):
+    print(f"Connected with result code {rc}")
+    for i in range(1, 7):
+        mqtt.subscribe(COMPONENTS[i])
 
-	for i in range(1, 7):
-		client.subscribe(COMPONENTS[i])
-
-
-# method for receiving MQTT messages
-def on_message(client, userdata, message):
-
-	# get the topic (i.e. who sent it)
+@mqtt.on_message()
+def handle_mqtt_message(client, userdata, message):
 	topic = message.topic
+	msg = message.payload.decode('utf-8').strip()
 
-	# get the message itself
-	msg = message.payload.decode("utf-8").strip()
+	print(topic, msg, "test")
 
-	# if the component is okay, set its status to 1
 	if msg == "OK":
 		status[topic] = 1
-	# if the component started, set to 0.5
+		socketio.emit(topic, {"status": "ready to begin"})
+
 	elif msg == "START":
 		status[topic] = 0.5
-	# if the component has an error, set to -1
+		socketio.emit(topic, {"status": "running"})
+
 	elif msg == "ERROR":
 		status[topic] = -1
-	
+		socketio.emit(topic, {"status": "error!"})
 
-# set its connection and message callback functions
-m_client.on_connect = on_connect
-m_client.on_message = on_message
 
-# connect to broker
-m_client.connect("localhost")
 
-# set up GPIO pins for the motor
-STEP_PIN = 5
-MS1_PIN = 6
-MS2_PIN = 13
-MS3_PIN = 19
-
-GPIO.setmode(GPIO.BCM)
-
-GPIO.setup(STEP_PIN, GPIO.OUT)
-GPIO.setup(MS1_PIN, GPIO.OUT)
-GPIO.setup(MS2_PIN, GPIO.OUT)
-GPIO.setup(MS3_PIN, GPIO.OUT)
-
+# create serial connection for Arduino
+ser = serial.Serial("/dev/ttyACM0", 115200, timeout=1)
+ser.reset_input_buffer()
 
 # method to move the conveyor
 def move_conveyor():
-	pass
+	print("test")
+	ser.write(b"start\n")
+	
+	mqtt.publish("conveyor", payload="begin")
+
+# threading method to update status of conveyor
+def check_conveyor():
+	if ser.in_waiting > 0:
+		message = ser.readline().strip()
+		print(message)
+		# update its status
+		if message == "running":
+			status["conveyor"] = 1
+			socketio.emit("conveyor", {"status": "running"})
+		elif message == "stopped":
+			status["conveyor"] = 0
+			socketio.emit("conveyor", {"status": "stopped"})
 
 # threading method to constantly check if all components are good
 def check_all():
+
+	print(status)
+
+	for i in range(1, 7):
+		msg = status[COMPONENTS[i]]
+		if msg == 1:
+			socketio.emit(COMPONENTS[i], {"status": "ready to begin"})
+
+		elif msg == 0.5:
+			socketio.emit(COMPONENTS[i], {"status": "running"})
+
+		elif msg == -1:
+			socketio.emit(COMPONENTS[i], {"status": "error!"})
 
 	# assume everything is good
 	all_good = 1
@@ -89,9 +114,9 @@ def check_all():
 	
 	# if everything is still good, then run the stepper motor/conveyor
 	if all_good:
-		# set everything to 0 as it's a new cycle
+		# set everything to 0.5 as it's a new cycle
 		for i in range(1, 7):
-			status[COMPONENTS[i]] = 0
+			status[COMPONENTS[i]] = 0.5
 
 		# move the conveyor
 		move_conveyor()
@@ -100,6 +125,7 @@ def check_all():
 # main page
 @app.route("/")
 def index():
+	# move_conveyor()
 	return render_template("index.html")
 
 
@@ -108,10 +134,17 @@ if __name__ == '__main__':
 
 	# create the threading scheduler
 	scheduler = APScheduler()
-	# adding the check method to the threader
+	# adding the check methods to the threader
 	scheduler.add_job(func=check_all, trigger="interval", id="job", seconds=1)
+	scheduler.add_job(func=check_conveyor, trigger="interval", id="job1", seconds=0.01, max_instances=10000)
 	# start the threader
 	scheduler.start()
+
+
+	# tell components to start
+
 	
     # start the Flask app
 	app.run(host = "0.0.0.0", port=5000)
+
+	
